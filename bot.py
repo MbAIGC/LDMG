@@ -57,9 +57,10 @@ if PAGE_SIZE < 1:
 
 PROJECTS_CACHE_TTL = 15  # 项目扫描结果缓存秒数
 
-# docker pull 每层进度的重复噪音行（如 a70dc7213cc7 Extracting 12s / Downloading 3%）
-_PULL_PROGRESS_NOISE_RE = re.compile(
-    r"^[0-9a-f]{8,64}\s+(?:Extracting\s+\d+\s*s|Downloading\s+\d+\s*%)$",
+# docker pull 每层进度的噪音行，仅在「最终完成消息」中过滤：
+# Downloading [==>...] 1MB/2MB、Downloading 3%、Download complete、Extracting 12s、Verifying Checksum 等
+_PULL_FINAL_NOISE_RE = re.compile(
+    r"^[0-9a-f]{8,64}\s+(?:Downloading\b|Download complete\b|Extracting\b|Verifying Checksum\b|Waiting\b)",
     re.IGNORECASE,
 )
 
@@ -389,6 +390,35 @@ async def edit_html_safe(message, html_text: str, fallback: Optional[str] = None
             pass
 
 
+async def _wait_process(process, output_lines: deque) -> int:
+    """获取子进程返回码，带超时兜底。
+
+    个别环境下 asyncio 可能收不到子进程退出通知，导致 process.wait()
+    永久挂起（进而卡死全局任务锁）。这里用短超时 + kill 重试兜底，
+    仍无法获得退出码时按输出内容推断结果。
+    """
+    try:
+        return await asyncio.wait_for(process.wait(), timeout=10)
+    except asyncio.TimeoutError:
+        pass
+
+    try:
+        process.kill()
+        try:
+            return await asyncio.wait_for(process.wait(), timeout=10)
+        except asyncio.TimeoutError:
+            return -9
+    except ProcessLookupError:
+        pass
+
+    rc = process.returncode
+    if rc is not None:
+        return rc
+    # 进程实际已退出（管道 EOF）但退出码丢失：按输出中是否有错误关键字推断
+    snippet = "\n".join(output_lines)
+    return 1 if re.search(r"(?i)\b(error|failed|denied|no such file)\b", snippet) else 0
+
+
 async def run_command_with_feedback(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -463,10 +493,8 @@ async def run_command_with_feedback(
                     elapsed = round(now - start_time, 1)
                     dyn_pct = min(progress_pct, max(5, 5 + int(elapsed * (progress_pct - 5) / 45)))
                     p_bar_cur = render_progress_bar(dyn_pct)
-                    preview_lines = [
-                        ln for ln in list(output_lines)[-11:]
-                        if not _PULL_PROGRESS_NOISE_RE.match(ln.strip())
-                    ]
+                    # 拉取过程中完整展示进度（含 Downloading/Extracting 等逐层进度）
+                    preview_lines = list(output_lines)[-11:]
                     if partial.strip():
                         preview_lines.append(partial.strip())
                     preview = "\n".join(preview_lines)
@@ -484,12 +512,13 @@ async def run_command_with_feedback(
                         pass
 
         await asyncio.wait_for(read_stream(), timeout=COMMAND_TIMEOUT)
-        returncode = await process.wait()
+        returncode = await _wait_process(process, output_lines)
 
         elapsed = round(time.time() - start_time, 1)
+        # 最终消息只保留关键结果行，过滤逐层进度噪音
         full_output = "\n".join(
             ln for ln in list(output_lines)[-25:]
-            if not _PULL_PROGRESS_NOISE_RE.match(ln.strip())
+            if not _PULL_FINAL_NOISE_RE.match(ln.strip())
         )
         safe_full_output = html.escape(full_output[-3500:])
 
@@ -524,7 +553,7 @@ async def run_command_with_feedback(
         if process:
             try:
                 process.kill()
-                await process.wait()
+                await asyncio.wait_for(process.wait(), timeout=10)
             except Exception:
                 pass
         await edit_html_safe(

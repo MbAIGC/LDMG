@@ -384,6 +384,7 @@ async def run_command_with_feedback(
     title: str = "执行中",
     progress_pct: int = 50,
     task_id: Optional[str] = None,
+    delete_on_success: bool = False,
 ) -> bool:
     global _CURRENT_PROCESS
     message = update.effective_message
@@ -484,6 +485,16 @@ async def run_command_with_feedback(
             return False
 
         if returncode == 0:
+            if delete_on_success:
+                try:
+                    await status_msg.delete()
+                except Exception:
+                    await edit_html_safe(
+                        status_msg,
+                        f"✅ <b>{safe_title} 完成</b>\n"
+                        f"⏱ <b>总耗时：</b>{elapsed}s",
+                    )
+                return True
             p_done = render_progress_bar(100)
             await edit_html_safe(
                 status_msg,
@@ -561,10 +572,10 @@ async def cmd_list(
     start_idx = (page - 1) * PAGE_SIZE
     page_projects = projects[start_idx:start_idx + PAGE_SIZE]
 
-    text = "🐳 <b>Docker Compose 管理面板</b>\n"
+    text = "🐳 <b>Docker Compose 管理面板 - TGBOT版</b>\n"
     text += f"📊 <b>统计：</b>共 {total_projects} 个项目 | 🟢 {running_cnt} 运行中 | 🟡 {total_projects - running_cnt} 停止\n"
     text += f"📖 <b>页码：</b>{page} / {total_pages}\n"
-    text += "───────────────────────────\n\n"
+    text += "\n"
 
     keyboard = []
 
@@ -591,8 +602,8 @@ async def cmd_list(
             safe_services = html.escape(services_str)
 
             text += f"<b>{num}.</b> {safe_name} {status_icon} <code>[{html.escape(status)}]</code>\n"
-            text += f"     📂 <code>{safe_dir}</code>\n"
-            text += f"     📦 服务({len(p['services'])}): {safe_services}\n\n"
+            text += f"     路径：<code>{safe_dir}</code>\n"
+            text += f"     容器({len(p['services'])}): {safe_services}\n\n"
 
             if len(p["services"]) > 1:
                 cb_data = create_cb_data("p_sel", {"name": name, "page": page})
@@ -763,6 +774,7 @@ async def do_upgrade_project(update: Update, context: ContextTypes.DEFAULT_TYPE,
             title=f"拉取新镜像 - {target_p['name']}",
             progress_pct=30,
             task_id=task_id,
+            delete_on_success=True,
         )
         if not pull_ok:
             return
@@ -823,6 +835,7 @@ async def do_upgrade_service(update: Update, context: ContextTypes.DEFAULT_TYPE,
             title=f"拉取服务镜像 - {service_name}",
             progress_pct=30,
             task_id=task_id,
+            delete_on_success=True,
         )
         if not pull_ok:
             return
@@ -888,6 +901,7 @@ async def do_upgrade_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 title=f"批量拉取 - {p_name}",
                 progress_pct=pct,
                 task_id=task_id,
+                delete_on_success=True,
             )
 
             up_ok = False
@@ -1238,6 +1252,23 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode="HTML")
 
 
+async def _set_bot_commands(application: Application) -> None:
+    """启动时注册 Bot 命令菜单（设置后无需再手动在 BotFather 配置）。"""
+    commands = [
+        ("start", "打开管理面板"),
+        ("list", "项目列表"),
+        ("status", "容器状态速览"),
+        ("prune", "镜像清理"),
+        ("upgrade", "升级项目/服务"),
+        ("help", "使用帮助"),
+    ]
+    try:
+        await application.bot.set_my_commands(commands)
+        logger.info("Bot 命令菜单已注册")
+    except Exception as e:
+        logger.warning(f"注册 Bot 命令菜单失败: {e}")
+
+
 # ==================== 主程序入口 ====================
 def main():
     if not BOT_TOKEN:
@@ -1246,7 +1277,12 @@ def main():
     if not ALLOWED_USER_IDS:
         logger.error("⚠️ ALLOWED_USER_IDS 未配置或为空，任何用户都无法使用 Bot，请检查 .env / 环境变量")
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .post_init(_set_bot_commands)
+        .build()
+    )
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("list", cmd_list))

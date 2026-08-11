@@ -1,0 +1,9 @@
+.env
+.git
+.github
+__pycache__
+*.pyc
+logs
+LDMG-Note.md
+bot-v1-grok.py
+docker-compose.yml

@@ -19,7 +19,14 @@ from logging.handlers import RotatingFileHandler
 from typing import List, Dict, Optional, Any
 
 from dotenv import load_dotenv
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    BotCommandScopeAllChatAdministrators,
+    BotCommandScopeAllGroupChats,
+    BotCommandScopeAllPrivateChats,
+)
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -49,6 +56,12 @@ if PAGE_SIZE < 1:
     PAGE_SIZE = 6
 
 PROJECTS_CACHE_TTL = 15  # 项目扫描结果缓存秒数
+
+# docker pull 每层进度的重复噪音行（如 a70dc7213cc7 Extracting 12s / Downloading 3%）
+_PULL_PROGRESS_NOISE_RE = re.compile(
+    r"^[0-9a-f]{8,64}\s+(?:Extracting\s+\d+\s*s|Downloading\s+\d+\s*%)$",
+    re.IGNORECASE,
+)
 
 # 全局任务状态管理
 _EXEC_LOCK: Optional[asyncio.Lock] = None
@@ -384,7 +397,6 @@ async def run_command_with_feedback(
     title: str = "执行中",
     progress_pct: int = 50,
     task_id: Optional[str] = None,
-    delete_on_success: bool = False,
 ) -> bool:
     global _CURRENT_PROCESS
     message = update.effective_message
@@ -451,7 +463,10 @@ async def run_command_with_feedback(
                     elapsed = round(now - start_time, 1)
                     dyn_pct = min(progress_pct, max(5, 5 + int(elapsed * (progress_pct - 5) / 45)))
                     p_bar_cur = render_progress_bar(dyn_pct)
-                    preview_lines = list(output_lines)[-11:]
+                    preview_lines = [
+                        ln for ln in list(output_lines)[-11:]
+                        if not _PULL_PROGRESS_NOISE_RE.match(ln.strip())
+                    ]
                     if partial.strip():
                         preview_lines.append(partial.strip())
                     preview = "\n".join(preview_lines)
@@ -472,7 +487,10 @@ async def run_command_with_feedback(
         returncode = await process.wait()
 
         elapsed = round(time.time() - start_time, 1)
-        full_output = "\n".join(list(output_lines)[-25:])
+        full_output = "\n".join(
+            ln for ln in list(output_lines)[-25:]
+            if not _PULL_PROGRESS_NOISE_RE.match(ln.strip())
+        )
         safe_full_output = html.escape(full_output[-3500:])
 
         if _CANCEL_REQUESTED:
@@ -485,16 +503,6 @@ async def run_command_with_feedback(
             return False
 
         if returncode == 0:
-            if delete_on_success:
-                try:
-                    await status_msg.delete()
-                except Exception:
-                    await edit_html_safe(
-                        status_msg,
-                        f"✅ <b>{safe_title} 完成</b>\n"
-                        f"⏱ <b>总耗时：</b>{elapsed}s",
-                    )
-                return True
             p_done = render_progress_bar(100)
             await edit_html_safe(
                 status_msg,
@@ -542,6 +550,8 @@ async def run_command_with_feedback(
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_permission(update):
         return
+    # 兜底：首次使用 /start 时再次确保命令菜单已注册
+    await _register_bot_commands(context.application)
     await cmd_list(update, context)
 
 async def cmd_list(
@@ -603,7 +613,7 @@ async def cmd_list(
 
             text += f"<b>{num}.</b> {safe_name} {status_icon} <code>[{html.escape(status)}]</code>\n"
             text += f"     路径：<code>{safe_dir}</code>\n"
-            text += f"     容器({len(p['services'])}): {safe_services}\n\n"
+            text += f"     容器：{safe_services}\n\n"
 
             if len(p["services"]) > 1:
                 cb_data = create_cb_data("p_sel", {"name": name, "page": page})
@@ -774,7 +784,6 @@ async def do_upgrade_project(update: Update, context: ContextTypes.DEFAULT_TYPE,
             title=f"拉取新镜像 - {target_p['name']}",
             progress_pct=30,
             task_id=task_id,
-            delete_on_success=True,
         )
         if not pull_ok:
             return
@@ -835,7 +844,6 @@ async def do_upgrade_service(update: Update, context: ContextTypes.DEFAULT_TYPE,
             title=f"拉取服务镜像 - {service_name}",
             progress_pct=30,
             task_id=task_id,
-            delete_on_success=True,
         )
         if not pull_ok:
             return
@@ -901,7 +909,6 @@ async def do_upgrade_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 title=f"批量拉取 - {p_name}",
                 progress_pct=pct,
                 task_id=task_id,
-                delete_on_success=True,
             )
 
             up_ok = False
@@ -1199,7 +1206,17 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if payload is None and action not in ("task_cancel",):
-            await query.answer("⚠️ 菜单响应超时，请重新输入 /list 打开", show_alert=True)
+            # 菜单已过期（内存映射被清理 / Bot 重启）：自动删除失效消息
+            try:
+                if query.message:
+                    await query.message.delete()
+                await query.answer("菜单已过期，已自动删除")
+            except Exception:
+                try:
+                    await query.edit_message_text("⚠️ 菜单已过期，请重新输入 /list 打开")
+                except Exception:
+                    pass
+                await query.answer("菜单已过期")
             return
 
         if action == "page_turn":
@@ -1252,21 +1269,49 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode="HTML")
 
 
+BOT_COMMANDS = [
+    ("start", "打开管理面板"),
+    ("list", "项目列表"),
+    ("status", "容器状态速览"),
+    ("prune", "镜像清理"),
+    ("upgrade", "升级项目/服务"),
+    ("help", "使用帮助"),
+]
+
+_COMMANDS_REGISTERED = False
+
+
+async def _register_bot_commands(application: Application) -> bool:
+    """注册 Bot 命令菜单（私聊 / 群聊 / 群管理员作用域），任一生效即视为成功。"""
+    global _COMMANDS_REGISTERED
+    if _COMMANDS_REGISTERED:
+        return True
+
+    scopes = [
+        None,  # 默认作用域 = 所有私聊
+        BotCommandScopeAllPrivateChats(),
+        BotCommandScopeAllGroupChats(),
+        BotCommandScopeAllChatAdministrators(),
+    ]
+    ok = 0
+    for scope in scopes:
+        try:
+            await application.bot.set_my_commands(BOT_COMMANDS, scope=scope)
+            ok += 1
+        except Exception as e:
+            logger.warning(f"注册命令菜单失败 (scope={scope}): {e}")
+
+    if ok:
+        _COMMANDS_REGISTERED = True
+        logger.info(f"Bot 命令菜单已注册（成功 {ok}/{len(scopes)} 个作用域）")
+        return True
+    logger.error("Bot 命令菜单注册失败：请检查 BOT_TOKEN 是否有效")
+    return False
+
+
 async def _set_bot_commands(application: Application) -> None:
     """启动时注册 Bot 命令菜单（设置后无需再手动在 BotFather 配置）。"""
-    commands = [
-        ("start", "打开管理面板"),
-        ("list", "项目列表"),
-        ("status", "容器状态速览"),
-        ("prune", "镜像清理"),
-        ("upgrade", "升级项目/服务"),
-        ("help", "使用帮助"),
-    ]
-    try:
-        await application.bot.set_my_commands(commands)
-        logger.info("Bot 命令菜单已注册")
-    except Exception as e:
-        logger.warning(f"注册 Bot 命令菜单失败: {e}")
+    await _register_bot_commands(application)
 
 
 # ==================== 主程序入口 ====================

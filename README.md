@@ -32,3 +32,7 @@
 - `/prune` — 镜像清理菜单（悬空镜像 / 所有未使用镜像）
 - `/upgrade` — 命令行升级（`/upgrade 01`、`/upgrade 01 emby`、`/upgrade all`）
 - `/help` — 使用帮助
+
+## 优化记录
+
+每次代码审查与优化记录按规范归档在 [docs/optimization-logs](docs/optimization-logs/README.md)，下一次优化前建议先阅读索引与最近一份记录。

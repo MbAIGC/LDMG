@@ -4,6 +4,6 @@
 __pycache__
 *.pyc
 logs
-LDMG-Note.md
+docs
 bot-v1-grok.py
 docker-compose.yml

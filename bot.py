@@ -13,6 +13,7 @@ import re
 import uuid
 import asyncio
 import subprocess
+import signal
 import logging
 from collections import deque
 from logging.handlers import RotatingFileHandler
@@ -96,6 +97,19 @@ async def begin_task(task_id: str) -> bool:
     _CURRENT_TASK = task_id
     _CANCEL_REQUESTED = False
     return True
+
+
+def stop_process_tree(process: Optional[asyncio.subprocess.Process]) -> None:
+    """终止 compose 进程组，避免取消时留下子进程。"""
+    if not process or process.returncode is not None:
+        return
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except (AttributeError, ProcessLookupError, PermissionError):
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
 
 
 def end_task() -> None:
@@ -236,7 +250,8 @@ async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYP
 def get_compose_bin() -> List[str]:
     """探测可用的 compose 命令：优先 docker compose（v2 插件），回退 docker-compose（v1/v2 独立版）。"""
     global _COMPOSE_BIN
-    if _COMPOSE_BIN is not None:
+    # 仅缓存成功结果；Docker/Compose 启动稍晚时允许后续请求重新探测。
+    if _COMPOSE_BIN:
         return _COMPOSE_BIN
 
     for cand in (["docker", "compose"], ["docker-compose"]):
@@ -269,6 +284,17 @@ def build_compose_cmd(project: Dict, *args: str) -> List[str]:
         cmd += ["-f", cf]
     cmd += list(args)
     return cmd
+
+
+def sort_projects_for_display(projects: List[Dict]) -> List[Dict]:
+    """使用与主面板一致的顺序，避免编号命令选中错误项目。"""
+    return sorted(
+        projects,
+        key=lambda p: (
+            0 if "running" in p.get("status", "").lower() else 1,
+            p.get("name", "").lower(),
+        ),
+    )
 
 
 def get_project_services(work_dir: str, config_files: List[str]) -> List[str]:
@@ -403,7 +429,7 @@ async def _wait_process(process, output_lines: deque) -> int:
         pass
 
     try:
-        process.kill()
+        stop_process_tree(process)
         try:
             return await asyncio.wait_for(process.wait(), timeout=10)
         except asyncio.TimeoutError:
@@ -454,6 +480,7 @@ async def run_command_with_feedback(
         process = await asyncio.create_subprocess_exec(
             *cmd,
             cwd=cwd,
+            start_new_session=True,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
         )
@@ -466,10 +493,7 @@ async def run_command_with_feedback(
             partial = ""
             while True:
                 if _CANCEL_REQUESTED:
-                    try:
-                        process.kill()
-                    except Exception:
-                        pass
+                    stop_process_tree(process)
                     break
 
                 chunk = await process.stdout.read(4096)
@@ -552,7 +576,7 @@ async def run_command_with_feedback(
     except asyncio.TimeoutError:
         if process:
             try:
-                process.kill()
+                stop_process_tree(process)
                 await asyncio.wait_for(process.wait(), timeout=10)
             except Exception:
                 pass
@@ -565,10 +589,7 @@ async def run_command_with_feedback(
 
     except Exception as e:
         if process:
-            try:
-                process.kill()
-            except Exception:
-                pass
+            stop_process_tree(process)
         await edit_html_safe(status_msg, f"❌ 执行发生异常: {html.escape(str(e))}")
         return False
     finally:
@@ -601,10 +622,7 @@ async def cmd_list(
     running_cnt = sum(1 for p in projects if "running" in p["status"].lower())
 
     # 运行中项目排前，组内按名称排序，主面板按状态分组展示
-    projects = sorted(
-        projects,
-        key=lambda p: (0 if "running" in p["status"].lower() else 1, p["name"].lower()),
-    )
+    projects = sort_projects_for_display(projects)
 
     total_pages = max(1, (total_projects + PAGE_SIZE - 1) // PAGE_SIZE)
     page = max(1, min(page, total_pages))
@@ -854,6 +872,13 @@ async def do_upgrade_service(update: Update, context: ContextTypes.DEFAULT_TYPE,
             await update.effective_message.reply_text(f"❌ 未找到项目: <code>{html.escape(project_name)}</code>", parse_mode="HTML")
             return
 
+        if service_name not in target_p.get("services", []):
+            await update.effective_message.reply_text(
+                f"❌ 项目 <b>{html.escape(project_name)}</b> 中不存在服务 <code>{html.escape(service_name)}</code>",
+                parse_mode="HTML",
+            )
+            return
+
         if not get_compose_bin():
             await update.effective_message.reply_text("❌ 未检测到 docker compose / docker-compose 命令", parse_mode="HTML")
             return
@@ -906,7 +931,7 @@ async def do_upgrade_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if query: await query.answer()
 
     try:
-        projects = await get_compose_projects()
+        projects = sort_projects_for_display(await get_compose_projects())
         if not projects:
             await update.effective_message.reply_text("未检测到可升级的项目")
             return
@@ -1001,6 +1026,66 @@ async def cmd_prune(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await show_prune_menu(update, context)
 
 
+async def _run_docker_capture(*args: str) -> tuple[int, str]:
+    """执行只读 Docker 查询，返回退出码和合并后的输出。"""
+    proc = await asyncio.create_subprocess_exec(
+        "docker", *args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+    stdout, _ = await proc.communicate()
+    return proc.returncode or 0, stdout.decode("utf-8", errors="replace")
+
+
+async def _scan_prune_candidates(prune_all: bool) -> tuple[bool, str, str]:
+    """扫描与 prune 命令语义一致的候选镜像，禁止把全部镜像误报为待删除。"""
+    if not prune_all:
+        rc, output = await _run_docker_capture(
+            "image", "ls", "--filter", "dangling=true", "--no-trunc",
+            "--format", "{{.ID}}\t{{.Repository}}:{{.Tag}}\t{{.Size}}",
+        )
+        return rc == 0, output.strip(), output
+
+    rc, image_output = await _run_docker_capture(
+        "image", "ls", "-a", "--no-trunc",
+        "--format", "{{.ID}}\t{{.Repository}}:{{.Tag}}\t{{.Size}}",
+    )
+    if rc != 0:
+        return False, "", image_output
+
+    rc, container_output = await _run_docker_capture("ps", "-aq")
+    if rc != 0:
+        return False, "", container_output
+
+    container_ids = [line.strip() for line in container_output.splitlines() if line.strip()]
+    referenced_ids = set()
+    if container_ids:
+        rc, inspect_output = await _run_docker_capture(
+            "inspect", "--format", "{{.Image}}", *container_ids
+        )
+        if rc != 0:
+            return False, "", inspect_output
+        referenced_ids = {
+            line.strip() for line in inspect_output.splitlines()
+            if line.strip()
+        }
+
+    candidates = []
+    seen_ids = set()
+    for line in image_output.splitlines():
+        parts = line.split("\t", 2)
+        if len(parts) != 3:
+            continue
+        image_id, repo_tag, size = (part.strip() for part in parts)
+        normalized_id = image_id if image_id.startswith("sha256:") else f"sha256:{image_id}"
+        if normalized_id in referenced_ids or normalized_id in seen_ids:
+            continue
+        seen_ids.add(normalized_id)
+        candidates.append(f"{image_id}\t{repo_tag}\t{size}")
+
+    return True, "\n".join(candidates), ""
+
+
 async def ask_prune_confirm(update: Update, prune_all: bool):
     query = update.callback_query
     message = update.effective_message
@@ -1009,26 +1094,15 @@ async def ask_prune_confirm(update: Update, prune_all: bool):
     label = "所有未使用" if prune_all else "悬空 (dangling)"
     await query.edit_message_text(f"🔍 正在扫描系统中的 <b>{label}</b> 镜像...", parse_mode="HTML")
 
-    cmd = ["docker", "images"]
-    if not prune_all:
-        cmd.extend(["-f", "dangling=true"])
-    cmd.extend(["--format", "table {{.Repository}}\t{{.Tag}}\t{{.ID}}\t{{.Size}}"])
-
     try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT
-        )
-        stdout, _ = await proc.communicate()
-        
-        if proc.returncode != 0:
-            await message.reply_text(f"❌ 扫描镜像异常: <code>{html.escape(stdout.decode())}</code>", parse_mode="HTML")
+        ok, dry_output, error_output = await _scan_prune_candidates(prune_all)
+        if not ok:
+            await message.reply_text(
+                f"❌ 扫描镜像异常：<code>{html.escape(error_output[-3000:])}</code>",
+                parse_mode="HTML",
+            )
             return
-
-        dry_output = stdout.decode('utf-8', errors='replace').strip()
-
-        if not dry_output or len(dry_output.splitlines()) <= 1:
+        if not dry_output:
             await message.reply_text(f"✨ 系统内未检测到可清理的 <b>{label}</b> 镜像！", parse_mode="HTML")
             return
     except Exception as e:
@@ -1037,17 +1111,15 @@ async def ask_prune_confirm(update: Update, prune_all: bool):
 
     cb_confirm = create_cb_data("prune_do", {"all": prune_all})
     cb_cancel = create_cb_data("page_turn", {"page": 1})
-
-    keyboard = [
-        [
-            InlineKeyboardButton("✅ 确认清理", callback_data=cb_confirm),
-            InlineKeyboardButton("❌ 取消", callback_data=cb_cancel),
-        ]
-    ]
-    
+    keyboard = [[
+        InlineKeyboardButton("✅ 确认清理", callback_data=cb_confirm),
+        InlineKeyboardButton("❌ 取消", callback_data=cb_cancel),
+    ]]
     safe_dry = html.escape(dry_output[-3000:])
+    note = "确认时 Docker 会重新判断实际可清理范围。"
     await message.reply_text(
-        f"🧹 <b>待清理镜像预判 (范围: {label})：</b>\n<code>{safe_dry}</code>\n\n确认执行清理吗？",
+        f"🧹 <b>当前可清理镜像快照 (范围: {label})：</b>\n"
+        f"<code>{safe_dry}</code>\n\n{note}\n确认执行清理吗？",
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="HTML",
     )
@@ -1069,12 +1141,23 @@ async def do_prune(update: Update, context: ContextTypes.DEFAULT_TYPE, prune_all
         if prune_all:
             cmd.append("-a")
 
-        await run_command_with_feedback(
+        success = await run_command_with_feedback(
             update, context, cmd,
             title="清理系统镜像",
             progress_pct=90,
             task_id=task_id,
         )
+        if success:
+            invalidate_projects_cache()
+            await update.effective_message.reply_text(
+                f"✅ <b>{html.escape('所有未使用' if prune_all else '悬空')}镜像清理完成</b>",
+                parse_mode="HTML",
+            )
+        else:
+            await update.effective_message.reply_text(
+                f"❌ <b>{html.escape('所有未使用' if prune_all else '悬空')}镜像清理失败或已取消</b>",
+                parse_mode="HTML",
+            )
     finally:
         end_task()
 
@@ -1149,7 +1232,7 @@ async def cmd_upgrade(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if num < 1: raise ValueError
         idx = num - 1
         
-        projects = await get_compose_projects()
+        projects = sort_projects_for_display(await get_compose_projects())
         if 0 <= idx < len(projects):
             target_p = projects[idx]
             p_name = target_p['name']
@@ -1157,6 +1240,12 @@ async def cmd_upgrade(update: Update, context: ContextTypes.DEFAULT_TYPE):
             safe_dir = html.escape(target_p['dir'])
             
             if service_name:
+                if service_name not in target_p.get("services", []):
+                    await update.message.reply_text(
+                        f"❌ 项目 <b>{safe_p_name}</b> 中不存在服务 <code>{html.escape(service_name)}</code>",
+                        parse_mode="HTML",
+                    )
+                    return
                 safe_svc = html.escape(service_name)
                 cb_confirm = create_cb_data("up_svc_do", {"name": p_name, "svc": service_name})
                 keyboard = [[

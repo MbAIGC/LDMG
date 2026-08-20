@@ -70,5 +70,5 @@ jobs:
         run: |
           docker run --rm \
             -e BOT_TOKEN=123456:smoke \
-            "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:main" \
+            "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }}" \
             sh -c "docker --version && docker compose version && docker-compose version && python3 -c 'import bot'"
